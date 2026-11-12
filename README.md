@@ -85,7 +85,20 @@ The Enabler joins the DDS system as one participant. These members of
   host. It reaches the participants on the same host and on the same network
   segment; it does not cross a router, a VPN or a NAT.
 - `shm` reaches only participants on the same host and sharing `/dev/shm` - a
-  container without `--ipc=host` does not.
+  container without `--ipc=host` does not. And only those running as the same
+  user: Fast DDS makes its segments mode 0644, so a ROS 2 container running as
+  root is found but sends nothing readable - its endpoints are discovered, its
+  samples never arrive. Run it as the broker's user (`docker run --user
+  $(id -u):$(id -g) -e HOME=/tmp ...`).
+- A firewall on this host that drops the multicast makes Fast DDS's UDP send
+  fail with EPERM, retried about every 100 ms. Cloudflare WARP's leak
+  protection does this to multicast on the LAN even with the LAN excluded from
+  the tunnel (`warp-cli tunnel ip add 224.0.0.0/4` excludes the multicast).
+  Participants on this host are still found (shared memory, loopback); the
+  ones on the LAN are not. The log says so in one line, `dds: a UDP send
+  refused by this machine's firewall (EPERM) ...`.
+- The Enabler's and Fast DDS's messages go to the broker's log, and only
+  there. One repeated is logged once a minute, with how many were left out.
 - `whitelist-interfaces` takes addresses, not interface names. With none of
   them on this host, the participant finds nothing; Fast DDS logs `All
   whitelist interfaces were filtered out`.

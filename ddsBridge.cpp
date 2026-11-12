@@ -1388,10 +1388,56 @@ static void dataDeliver(const char* topicName, const char* json, int64_t publish
 // broker has one. The plugin's OWN messages use KT_* directly, like any other
 // plugin.
 //
+// ⭐ A message repeated is logged ONCE A MINUTE, with how many were left out. Fast DDS retries what failed
+// every 100 ms or so - its discovery's multicast blocked by a firewall was 518 lines in one run.
+//
+// ⭐ That one, "Operation not permitted" from send, is said in words: on UDP, EPERM from sendto is the local
+// firewall dropping the packet - a VPN's leak protection (Cloudflare WARP's drops multicast on the LAN), or
+// nftables/iptables. Discovery on this machine still works (shared memory, loopback); participants on the
+// LAN are not found.
+//
+struct LogRepeat
+{
+    std::chrono::steady_clock::time_point last;      // when it was last logged
+    unsigned long                         left = 0;  // how many since then were not
+};
+
+static std::mutex                         logRepeatMutex;
+static std::map<std::string, LogRepeat>   logRepeats;
+
 void logConsumer(const char* fileName, int lineNo, const char* funcName, int category, const char* msg)
 {
     if (broker == nullptr)
         return;
+
+    //
+    // A repeat within a minute: counted, not logged
+    //
+    unsigned long left = 0;
+    {
+        std::string                           key = std::string(funcName ? funcName : "") + '\x1f' + (msg ? msg : "");
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex>           lock(logRepeatMutex);
+        auto                                  it  = logRepeats.find(key);
+
+        if (it != logRepeats.end())
+        {
+            if (now - it->second.last < std::chrono::seconds(60))
+            {
+                ++it->second.left;
+                return;
+            }
+            left             = it->second.left;
+            it->second.last  = now;
+            it->second.left  = 0;
+        }
+        else
+        {
+            if (logRepeats.size() >= 1000)    // a flood of different messages: start counting again
+                logRepeats.clear();
+            logRepeats[key].last = now;
+        }
+    }
 
     //
     // The Enabler's categories run from informational to error in its own
@@ -1399,7 +1445,17 @@ void logConsumer(const char* fileName, int lineNo, const char* funcName, int cat
     //
     int severity = (category >= 2) ? BRIDGE_LOG_ERROR : (category == 1) ? BRIDGE_LOG_WARNING : BRIDGE_LOG_INFO;
 
-    broker->logFunction(severity, fileName, lineNo, funcName, msg);
+    std::string text(msg ? msg : "");
+
+    if ((funcName != nullptr) && (strcmp(funcName, "send") == 0) && (text == "Operation not permitted"))
+        text = "dds: a UDP send refused by this machine's firewall (EPERM) - a VPN's leak protection (Cloudflare WARP) "
+               "or nftables/iptables; usually DDS discovery's multicast (239.255.0.1:7400) on an interface: "
+               "participants on this machine are still found, participants on the LAN are not";
+
+    if (left != 0)
+        text += " (" + std::to_string(left) + " more like it in the last minute, not logged)";
+
+    broker->logFunction(severity, fileName, lineNo, funcName, text.c_str());
 }
 
 // -----------------------------------------------------------------------------
@@ -2027,6 +2083,9 @@ static void configReload(const std::string& path)
     try
     {
         eprosima::ddsenabler::yaml::EnablerConfiguration configuration(ddsModule);
+
+        configuration.ddspipe_configuration.log_configuration.stdout_enable = false;   // logConsumer only - see there
+
         eprosima::utils::ReturnCode                     ret = enabler->reload_configuration(configuration);
 
         if (ret == eprosima::utils::ReturnCode::RETCODE_OK)
@@ -2223,6 +2282,12 @@ int init(const char* configFile, const BridgeBroker* brokerP)
     try
     {
         eprosima::ddsenabler::yaml::EnablerConfiguration configuration(ddsModule);
+
+        //
+        // The messages go to the broker's log through logConsumer, and only there: with stdout_enable (ddspipe's
+        // default) each one ALSO went to stdout, a second copy in colour codes
+        //
+        configuration.ddspipe_configuration.log_configuration.stdout_enable = false;
 
         created = eprosima::ddsenabler::create_dds_enabler(configuration, callbacks, enabler);
 
